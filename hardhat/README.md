@@ -1,57 +1,193 @@
-# Sample Hardhat 3 Project (`node:test` and `viem`)
+# AIJudge — Privacy-Preserving Commit-Reveal Bounty Judge
 
-This project showcases a Hardhat 3 project using the native Node.js test runner (`node:test`) and the `viem` library for Ethereum interactions.
+On-chain bounty system with **commit-reveal privacy** and **AI judging** via Ritual's LLM precompile (0x0802).
 
-To learn more about Hardhat 3, please visit the [Getting Started guide](https://hardhat.org/docs/getting-started#getting-started-with-hardhat-3). To share your feedback, join our [Hardhat 3](https://hardhat.org/hardhat3-telegram-group) Telegram group or [open an issue](https://github.com/NomicFoundation/hardhat/issues/new) in our GitHub issue tracker.
+## Problem
 
-## Project Overview
+Original `AIJudge.sol` had a critical flaw: `submitAnswer()` stored plaintext answers on-chain. Any participant could read others' submissions and submit an improved version.
 
-This example project includes:
+## Solution: Commit-Reveal Flow
 
-- A simple Hardhat configuration file.
-- Foundry-compatible Solidity unit tests.
-- TypeScript integration tests using [`node:test`](nodejs.org/api/test.html), the new Node.js native test runner, and [`viem`](https://viem.sh/).
-- Examples demonstrating how to connect to different types of networks, including locally simulating OP mainnet.
+Answers remain hidden until after the submission deadline. Participants commit a hash, then reveal after the deadline passes.
 
-## Usage
+### Lifecycle
 
-### Running Tests
-
-To run all the tests in the project, execute the following command:
-
-```shell
-npx hardhat test
+```
+Phase 1: OPEN (Commit Phase)
+┌─────────────────────────────────────────────────────┐
+│  Owner creates bounty with ETH reward + deadline    │
+│  Participants submit commitment hashes only         │
+│  commitment = keccak256(answer, salt, sender, id)   │
+│  Answers stay OFF-CHAIN — only hash on-chain        │
+└─────────────────────────────────────────────────────┘
+                         │
+                    deadline passes
+                         ▼
+Phase 2: COMMIT_CLOSED (Reveal Window — 1 hour)
+┌─────────────────────────────────────────────────────┐
+│  closeCommitPhase() transitions state               │
+│  Participants reveal answer + salt                  │
+│  Contract recomputes hash, verifies match           │
+│  Answers now visible on-chain                       │
+└─────────────────────────────────────────────────────┘
+                         │
+                   all reveals done
+                         ▼
+Phase 3: REVEALED (AI Judging)
+┌─────────────────────────────────────────────────────┐
+│  Owner calls judgeAll() with LLM precompile input   │
+│  Ritual 0x0802 evaluates all revealed submissions   │
+│  AI review stored on-chain as bytes                 │
+└─────────────────────────────────────────────────────┘
+                         │
+                    owner reviews
+                         ▼
+Phase 4: JUDGED → FINALIZED
+┌─────────────────────────────────────────────────────┐
+│  finalizeWinner(index) pays reward to winner        │
+│  ETH transferred, bounty marked complete             │
+└─────────────────────────────────────────────────────┘
 ```
 
-You can also selectively run the Solidity or `node:test` tests:
+### Required Functions
 
-```shell
-npx hardhat test solidity
-npx hardhat test nodejs
+| Function | Phase | Description |
+|----------|-------|-------------|
+| `createBounty(title, rubric, deadline)` | Open | Owner funds reward |
+| `submitCommitment(bountyId, commitment)` | Open | Participant commits hash |
+| `closeCommitPhase(bountyId)` | → CommitClosed | Anyone triggers after deadline |
+| `revealAnswer(bountyId, answer, salt)` | CommitClosed | Participant reveals answer |
+| `judgeAll(bountyId, llmInput)` | → Judged | Owner triggers AI evaluation |
+| `finalizeWinner(bountyId, winnerIndex)` | → Finalized | Owner picks winner, pays reward |
+
+### Commitment Hash Formula
+
+```solidity
+keccak256(abi.encodePacked(answer, salt, msg.sender, bountyId))
 ```
 
-### Make a deployment to Sepolia
+- `answer` — the participant's submission text
+- `salt` — random bytes32 chosen by participant
+- `msg.sender` — prevents front-running (different hash per participant)
+- `bountyId` — prevents cross-bounty replay
 
-This project includes an example Ignition module to deploy the contract. You can deploy this module to a locally simulated chain or to Sepolia.
+## Architecture
 
-To run the deployment to a local chain:
-
-```shell
-npx hardhat ignition deploy ignition/modules/Counter.ts
+```
+┌──────────────────────────────────────────────────────────────┐
+│                        Frontend (web/)                        │
+│  1. Generate random salt                                      │
+│  2. Compute commitment hash locally                           │
+│  3. submitCommitment() — only hash goes on-chain              │
+│  4. Store (answer, salt) in localStorage                      │
+│  5. After deadline: revealAnswer() with stored values         │
+└───────────────────────┬──────────────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    AIJudge.sol (on-chain)                     │
+│                                                              │
+│  Commitment[] ──┐                                            │
+│  ├── submitter  │  Commit phase: hash only                   │
+│  ├── hash       │  Reveal phase: verify + store answer       │
+│  ├── revealed   │  Judge phase: batch AI evaluation          │
+│  └── answer ────┘  Finalize phase: pay winner                │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  Ritual LLM Precompile (0x0802)                     │    │
+│  │  - Receives: all revealed answers + rubric           │    │
+│  │  - Returns: AI judgment (completionData)             │    │
+│  │  - TEE-backed: verifiable execution                  │    │
+│  └─────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-To run the deployment to Sepolia, you need an account with funds to send the transaction. The provided Hardhat configuration includes a Configuration Variable called `SEPOLIA_PRIVATE_KEY`, which you can use to set the private key of the account you want to use.
+### What's Public vs Hidden
 
-You can set the `SEPOLIA_PRIVATE_KEY` variable using the `hardhat-keystore` plugin or by setting it as an environment variable.
+| Data | When | Visibility |
+|------|------|-----------|
+| Bounty metadata (title, rubric, reward) | Always | Public |
+| Commitment hashes | Commit phase | Public (but meaningless without answer) |
+| Participant addresses | Commit phase | Public |
+| **Answers** | **Commit phase** | **HIDDEN** ← key improvement |
+| Answers | Reveal phase | Public (after verification) |
+| AI review | Judge phase | Public |
+| Winner + payout | Finalize | Public |
 
-To set the `SEPOLIA_PRIVATE_KEY` config variable using `hardhat-keystore`:
+## Test Plan
 
-```shell
-npx hardhat keystore set SEPOLIA_PRIVATE_KEY
+### Commit Phase Tests
+1. ✅ Submit commitment — hash stored, answer not visible
+2. ✅ Cannot submit after deadline
+3. ✅ Cannot submit empty commitment
+4. ✅ Cannot exceed MAX_SUBMISSIONS
+
+### Reveal Phase Tests
+5. ✅ Cannot reveal before deadline
+6. ✅ Reveal with correct answer + salt — success
+7. ❌ Reveal with wrong salt — reverts with "commitment mismatch"
+8. ❌ Reveal with wrong answer — reverts with "commitment mismatch"
+9. ❌ Double reveal — reverts with "already revealed"
+10. ❌ Non-submitter reveal — reverts with "no commitment found"
+11. ✅ Cannot reveal after REVEAL_WINDOW closes
+
+### Phase Transition Tests
+12. ✅ closeCommitPhase() transitions Open → CommitClosed
+13. ✅ judgeAll() transitions Revealed → Judged
+14. ✅ finalizeWinner() transitions Judged → Finalized
+15. ❌ Cannot skip phases (e.g., judgeAll without reveals)
+
+### Payment Tests
+16. ✅ finalizeWinner() transfers reward to winner
+17. ✅ Winner balance increases by reward amount
+18. ❌ Cannot finalize twice
+
+### Edge Cases
+19. Single submission — reveal + judge + finalize works
+20. MAX_SUBMISSIONS (10) — all reveal correctly
+21. Some reveal, some don't — only revealed are judged
+22. Bounty owner cannot participate (enforced off-chain or add modifier)
+
+## Setup & Run
+
+```bash
+cd hardhat
+pnpm install
+pnpm hardhat compile
+pnpm hardhat test test/AIJudge.test.ts
 ```
 
-After setting the variable, you can run the deployment with the Sepolia network:
+### Deploy to Ritual Testnet
 
-```shell
-npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
+```bash
+# Set env
+export DEPLOYER_PRIVATE_KEY=0x...
+
+# Deploy
+pnpm hardhat run scripts/deploy.ts --network ritual
 ```
+
+## Files
+
+```
+contracts/
+├── AIJudge.sol              # Commit-reveal bounty contract
+└── utils/
+    └── PrecompileConsumer.sol  # Ritual precompile helper
+
+test/
+└── AIJudge.test.ts          # Commit-reveal test suite
+
+scripts/
+└── deploy.ts                # Deployment script
+```
+
+## Reflection Question
+
+> "What should be public, what should stay hidden, and what should be decided by AI versus by a human in a bounty system?"
+
+**Public:** Bounty metadata (title, rubric, reward, deadlines) must be public so participants can evaluate whether to compete. Commitment hashes should also be public — they prove someone committed to an answer without revealing it, enabling trustless verification later. Participant addresses and the final AI review should be public for accountability and transparency.
+
+**Hidden:** Raw answers must remain hidden during the submission phase — this is the entire point of commit-reveal. Without privacy, fast followers can copy the best ideas and submit improved versions, destroying fairness. Salts should stay off-chain until reveal (participants store them locally). During the AI judging step, the plaintext answers exist temporarily in the LLM's execution context inside the TEE, but are never exposed to other participants or the public.
+
+**AI vs Human Judgment:** AI excels at batch-evaluating submissions against a rubric quickly, consistently, and without favoritism — ideal for initial screening and ranking. However, AI lacks contextual understanding of intent, cultural nuance, and creative originality. The optimal pattern is hybrid: AI performs first-pass evaluation (scoring, ranking), then the human bounty owner makes the final winner selection. This is exactly what our `judgeAll()` → `finalizeWinner()` two-step flow enables — AI informs, humans decide. In high-stakes bounties, human oversight prevents AI bias from determining outcomes; in low-stakes or high-volume bounties, the AI ranking alone may suffice.
